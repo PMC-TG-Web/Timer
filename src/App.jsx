@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, useEffect } from "react";
+import { useMemo, useRef, useState, useEffect, useCallback } from "react";
 import { motion } from "framer-motion";
 import {
   Plus,
@@ -12,8 +12,14 @@ import {
 } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import {
+  requestNotificationPermission,
+  scheduleNotification,
+  cancelAllNotifications,
+} from "@/services/notifications";
 
 const STORAGE_KEY = "seafood-boil-timer-items";
+const TIMER_STATE_KEY = "seafood-boil-timer-state";
 
 const DEFAULT_ITEM_PRESET = [
   { name: "Potatoes", minutes: 20 },
@@ -56,6 +62,47 @@ function loadItems() {
   }
 }
 
+function loadTimerState() {
+  try {
+    const raw = localStorage.getItem(TIMER_STATE_KEY);
+    if (!raw) {
+      return {
+        running: false,
+        elapsed: 0,
+        pausedElapsed: 0,
+        runStartedAt: null,
+        alertMessage: "",
+        firedDropTimes: {},
+      };
+    }
+
+    const parsed = JSON.parse(raw);
+    const runStartedAt = Number(parsed.runStartedAt);
+
+    return {
+      running: Boolean(parsed.running),
+      elapsed: Math.max(0, Number(parsed.elapsed || 0)),
+      pausedElapsed: Math.max(0, Number(parsed.pausedElapsed || 0)),
+      runStartedAt: Number.isFinite(runStartedAt) ? runStartedAt : null,
+      alertMessage:
+        typeof parsed.alertMessage === "string" ? parsed.alertMessage : "",
+      firedDropTimes:
+        parsed.firedDropTimes && typeof parsed.firedDropTimes === "object"
+          ? parsed.firedDropTimes
+          : {},
+    };
+  } catch {
+    return {
+      running: false,
+      elapsed: 0,
+      pausedElapsed: 0,
+      runStartedAt: null,
+      alertMessage: "",
+      firedDropTimes: {},
+    };
+  }
+}
+
 function formatTime(totalSeconds) {
   const safe = Math.max(0, Math.floor(totalSeconds));
   const m = Math.floor(safe / 60);
@@ -84,12 +131,24 @@ function beep() {
 }
 
 export default function SeafoodBoilTimer() {
+  const [persistedTimerState] = useState(loadTimerState);
+
   const [items, setItems] = useState(loadItems);
-  const [running, setRunning] = useState(false);
-  const [elapsed, setElapsed] = useState(0);
-  const [alertMessage, setAlertMessage] = useState("");
-  const [firedDropTimes, setFiredDropTimes] = useState({});
-  const intervalRef = useRef(null);
+  const [running, setRunning] = useState(persistedTimerState.running);
+  const [elapsed, setElapsed] = useState(persistedTimerState.elapsed);
+  const [pausedElapsed, setPausedElapsed] = useState(
+    persistedTimerState.pausedElapsed,
+  );
+  const [runStartedAt, setRunStartedAt] = useState(
+    persistedTimerState.runStartedAt,
+  );
+  const [alertMessage, setAlertMessage] = useState(
+    persistedTimerState.alertMessage,
+  );
+  const [firedDropTimes, setFiredDropTimes] = useState(
+    persistedTimerState.firedDropTimes,
+  );
+  const lastElapsedRef = useRef(persistedTimerState.elapsed);
 
   const longestSeconds = useMemo(() => {
     return Math.max(...items.map((i) => Number(i.minutes || 0) * 60), 0);
@@ -118,28 +177,117 @@ export default function SeafoodBoilTimer() {
   const progress =
     longestSeconds > 0 ? Math.min(100, (elapsed / longestSeconds) * 100) : 0;
 
+  const computeElapsedNow = useCallback(
+    (nowMs = Date.now()) => {
+      if (!running || !runStartedAt) {
+        return Math.min(pausedElapsed, longestSeconds);
+      }
+
+      const liveElapsed =
+        pausedElapsed + Math.floor((nowMs - runStartedAt) / 1000);
+      return Math.min(longestSeconds, Math.max(0, liveElapsed));
+    },
+    [running, runStartedAt, pausedElapsed, longestSeconds],
+  );
+
   useEffect(() => {
     if (!running) return;
-    intervalRef.current = setInterval(() => {
-      setElapsed((prev) => Math.min(prev + 1, longestSeconds));
-    }, 1000);
-    return () => clearInterval(intervalRef.current);
-  }, [running, longestSeconds]);
+
+    const updateElapsed = () => {
+      setElapsed(computeElapsedNow());
+    };
+
+    updateElapsed();
+    const timerId = setInterval(updateElapsed, 1000);
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        updateElapsed();
+      }
+    };
+    const handleFocus = () => updateElapsed();
+
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("focus", handleFocus);
+
+    return () => {
+      clearInterval(timerId);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, [running, pausedElapsed, longestSeconds, elapsed, computeElapsedNow]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
   }, [items]);
 
   useEffect(() => {
-    if (!running) return;
+    localStorage.setItem(
+      TIMER_STATE_KEY,
+      JSON.stringify({
+        running,
+        elapsed,
+        pausedElapsed,
+        runStartedAt,
+        alertMessage,
+        firedDropTimes,
+      }),
+    );
+  }, [running, elapsed, pausedElapsed, runStartedAt, alertMessage, firedDropTimes]);
+
+  useEffect(() => {
+    requestNotificationPermission();
+  }, []);
+
+  useEffect(() => {
+    if (!running || longestSeconds <= 0) {
+      cancelAllNotifications();
+      return;
+    }
+
+    const scheduleDropNotifications = async () => {
+      for (const item of schedule) {
+        if (!firedDropTimes[item.id]) {
+          const remainingSeconds = Math.max(0, item.dropAt - elapsed);
+          await scheduleNotification(
+            `drop-${item.id}`,
+            "Drop in: " + item.name,
+            `Time to add ${item.name} to the boil`,
+            remainingSeconds,
+          );
+        }
+      }
+
+      const finishRemainingSeconds = Math.max(0, longestSeconds - elapsed);
+      if (finishRemainingSeconds > 0) {
+        await scheduleNotification(
+          "boil-done",
+          "Boil Complete!",
+          "Pull everything out of the water",
+          finishRemainingSeconds,
+        );
+      }
+    };
+
+    scheduleDropNotifications();
+  }, [running, elapsed, schedule, firedDropTimes, longestSeconds]);
+
+  useEffect(() => {
+    if (!running) {
+      lastElapsedRef.current = elapsed;
+      return;
+    }
+
+    const previousElapsed = lastElapsedRef.current;
 
     const dueItems = schedule.filter((item) => {
-      return elapsed === item.dropAt && !firedDropTimes[item.id];
+      const dueAtStart =
+        previousElapsed === 0 && elapsed === 0 && item.dropAt === 0;
+      const dueInRange = item.dropAt > previousElapsed && item.dropAt <= elapsed;
+      return (dueAtStart || dueInRange) && !firedDropTimes[item.id];
     });
 
     if (dueItems.length > 0) {
       const names = dueItems.map((i) => i.name).join(", ");
-      // eslint-disable-next-line react-hooks/set-state-in-effect
       setAlertMessage(`Drop in: ${names}`);
       beep();
       setFiredDropTimes((prev) => {
@@ -149,11 +297,15 @@ export default function SeafoodBoilTimer() {
       });
     }
 
-    if (longestSeconds > 0 && elapsed === longestSeconds) {
+    if (longestSeconds > 0 && elapsed >= longestSeconds) {
       setRunning(false);
+      setRunStartedAt(null);
+      setPausedElapsed(longestSeconds);
       setAlertMessage("Done! Pull everything out.");
       beep();
     }
+
+    lastElapsedRef.current = elapsed;
   }, [elapsed, schedule, firedDropTimes, running, longestSeconds]);
 
   function updateItem(id, field, value) {
@@ -182,9 +334,13 @@ export default function SeafoodBoilTimer() {
 
   function reset() {
     setRunning(false);
+    setRunStartedAt(null);
+    setPausedElapsed(0);
     setElapsed(0);
     setAlertMessage("");
     setFiredDropTimes({});
+    lastElapsedRef.current = 0;
+    cancelAllNotifications();
   }
 
   function resetDefaults() {
@@ -194,7 +350,26 @@ export default function SeafoodBoilTimer() {
 
   function startPause() {
     if (longestSeconds <= 0) return;
-    setRunning((prev) => !prev);
+
+    if (running) {
+      const currentElapsed = computeElapsedNow();
+      setRunning(false);
+      setRunStartedAt(null);
+      setPausedElapsed(currentElapsed);
+      setElapsed(currentElapsed);
+      return;
+    }
+
+    if (elapsed >= longestSeconds) {
+      setElapsed(0);
+      setPausedElapsed(0);
+      setAlertMessage("");
+      setFiredDropTimes({});
+      lastElapsedRef.current = 0;
+    }
+
+    setRunStartedAt(Date.now());
+    setRunning(true);
   }
 
   return (
